@@ -1,0 +1,9 @@
+company_code,gl_account,gl_description,prev_amount,curr_amount
+C001,1000,Cash and Bank,50000,45000
+C001,1100,Accounts Receivable,120000,180000
+C001,2000,Accounts Payable,-80000,-95000
+C001,3000,Revenue,-200000,-240000
+C001,4000,Operating Expenses,110000,125000
+C001,5000,Fixed Assets,300000,310000
+C001,5100,Accumulated Depreciation,-100000,-115000
+C001,6000,Equity,-200000,-210000

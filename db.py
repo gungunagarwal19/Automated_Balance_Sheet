@@ -75,7 +75,9 @@ def init_db():
             gl_description TEXT,
             doc_no TEXT,
             posting_date TEXT,
-            amount REAL,
+            prev_amount REAL DEFAULT 0.0,
+            curr_amount REAL,
+            variance_pct REAL,
             currency TEXT,
             cost_center TEXT,
             profit_center TEXT,
@@ -83,11 +85,13 @@ def init_db():
             reference TEXT,
             source TEXT,         -- 'SAP' or 'NON_SAP'
             batch_id TEXT,        -- daily run identifier
-            status TEXT DEFAULT 'awaiting_support' 
-              CHECK (status IN ('awaiting_support','submitted','reviewed','fc_approved')),
+            status TEXT DEFAULT 'awaiting_maker' 
+              CHECK (status IN ('awaiting_maker','submitted_to_reviewer','awaiting_reviewer','submitted_to_fc','awaiting_fc','submitted_to_cfo','awaiting_cfo','approved','disapproved')),
+            current_stage TEXT DEFAULT 'maker' CHECK(current_stage IN ('maker','reviewer','fc','cfo','approved')),
             maker_id INTEGER REFERENCES users(id),
             reviewer_id INTEGER REFERENCES users(id),
             fc_id INTEGER REFERENCES users(id),
+            cfo_id INTEGER REFERENCES users(id),
             created_at TEXT DEFAULT (datetime('now'))
         );
 
@@ -99,13 +103,24 @@ def init_db():
             uploaded_at TEXT DEFAULT (datetime('now'))
         );
 
-        -- One editable comment per trial line. Any user can edit; visible to all.
+        -- Multiple comments per trial line - chained comments from maker -> reviewer -> fc -> cfo
         CREATE TABLE IF NOT EXISTS gl_comments(
             id INTEGER PRIMARY KEY,
-            trial_line_id INTEGER UNIQUE REFERENCES trial_lines(id) ON DELETE CASCADE,
+            trial_line_id INTEGER REFERENCES trial_lines(id) ON DELETE CASCADE,
             comment TEXT,
-            updated_by INTEGER REFERENCES users(id),
-            updated_at TEXT DEFAULT (datetime('now'))
+            commented_by INTEGER REFERENCES users(id),
+            role TEXT CHECK(role IN ('maker','reviewer','fc','cfo','admin')),
+            commented_at TEXT DEFAULT (datetime('now'))
+        );
+        
+        -- Track disapprovals with reason and who disapproved
+        CREATE TABLE IF NOT EXISTS disapprovals(
+            id INTEGER PRIMARY KEY,
+            trial_line_id INTEGER REFERENCES trial_lines(id) ON DELETE CASCADE,
+            disapproved_by INTEGER REFERENCES users(id),
+            disapproved_from_role TEXT CHECK(disapproved_from_role IN ('reviewer','fc','cfo')),
+            reason TEXT,
+            disapproved_at TEXT DEFAULT (datetime('now'))
         );
 
         -- Rejections: record when a maker or reviewer rejects a trial line

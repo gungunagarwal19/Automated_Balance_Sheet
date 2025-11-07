@@ -242,7 +242,7 @@ with tab2:
 
             # Single allowed variation (applies to all rows) and show only rows meeting/exceeding it
             st.write("### Review variations and add comments where needed")
-            allowed_batch = st.number_input("Allowed variation % for this batch", value=70.0, step=0.1, help="If actual variation for a row is >= this percent (or infinite), it will be shown here and a reason required.")
+            allowed_batch = st.number_input("Allowed variation % for this batch", value=35.0, step=0.1, help="If actual variation for a row is >= this percent (or infinite), it will be shown here and a reason required.")
             # build mask of rows exceeding or equal to allowed_batch
             def exceeds_allowed(r):
                 actual = r['actual_variation_pct']
