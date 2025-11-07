@@ -58,6 +58,15 @@ def init_db():
             user_id INTEGER REFERENCES users(id)
         );
 
+        -- FS grouping to role mapping (fallback when GL-level responsibility not present)
+        CREATE TABLE IF NOT EXISTS fs_responsibilities(
+            id INTEGER PRIMARY KEY,
+            fs_group TEXT,
+            role TEXT CHECK(role IN ('maker','reviewer','fc','cfo','admin')),
+            user_id INTEGER REFERENCES users(id),
+            UNIQUE(fs_group, role)
+        );
+
         -- Trial lines (ingested or manual)
         CREATE TABLE IF NOT EXISTS trial_lines(
             id INTEGER PRIMARY KEY,

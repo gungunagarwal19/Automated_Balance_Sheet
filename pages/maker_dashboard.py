@@ -115,6 +115,13 @@ with tab2:
                 index=0 if not find_best_match(df.columns, ["profit", "pc"]) else 
                      list(df.columns).index(find_best_match(df.columns, ["profit", "pc"])) + 1
             )
+            
+            fs_col = st.selectbox(
+                "Financial Statement Grouping Column (optional, e.g. 'FS Grouping Main Head')",
+                options=["[Skip]"] + list(df.columns),
+                index=0 if not find_best_match(df.columns, ["fs grouping", "grouping", "main head"]) else 
+                     list(df.columns).index(find_best_match(df.columns, ["fs grouping", "grouping", "main head"])) + 1
+            )
         
         if st.button("Ingest NON-SAP Trial"):
             if not all([company_col, gl_col, amount_col]):
@@ -141,6 +148,40 @@ with tab2:
             # Add remaining required fields
             mapped_df["source"] = "NON_SAP"
             mapped_df["batch_id"] = "manual_" + pd.Timestamp.now().strftime("%Y%m%d%H%M")
+
+            # Basic validation: total of trial should be nil (sum to 0)
+            try:
+                total_sum = mapped_df['amount'].sum()
+            except Exception:
+                st.error("Could not compute total amount. Ensure amount column contains numeric values.")
+                st.stop()
+            if abs(total_sum) > 1e-6:
+                st.error(f"❌ Trial total is not nil. Sum(amount) = {total_sum}. Please correct the data before ingestion.")
+                st.stop()
+
+            # Basic FS checks: if FS grouping column provided, ensure assets positive and liabilities negative
+            fs_issues = []
+            if fs_col and fs_col != "[Skip]":
+                # try to inspect mapped_df against original DF's fs column
+                try:
+                    mapped_df['fs_group'] = df[fs_col]
+                    # simple keyword matching
+                    for idx, row in mapped_df.iterrows():
+                        g = str(row.get('fs_group','')).lower()
+                        amt = float(row.get('amount') or 0)
+                        if 'asset' in g and amt < 0:
+                            fs_issues.append((row['company_code'], row['gl_account'], amt, 'asset should be positive'))
+                        if 'liab' in g or 'liability' in g and amt > 0:
+                            fs_issues.append((row['company_code'], row['gl_account'], amt, 'liability should be negative'))
+                except Exception:
+                    # ignore if mapping fails
+                    pass
+            if fs_issues:
+                st.warning("⚠️ Financial statement sign issues detected for some lines:")
+                for iss in fs_issues:
+                    st.write(f"Company {iss[0]} GL {iss[1]} amount {iss[2]} — {iss[3]}")
+                if not st.checkbox("Override FS sign warnings and continue ingestion"):
+                    st.stop()
         
             # Convert to records for insertion
             rows = mapped_df.to_dict(orient="records")
@@ -167,15 +208,4 @@ with tab2:
                     st.error(f"❌ Error ingesting data: {str(e)}")
                     st.stop()
 
-        from services import insert_trial_batch, notify_maker_upload_support
-        insert_trial_batch(rows, rows[0]["batch_id"], "NON_SAP")
-
-        # notify current maker for all new lines assigned to them today
-        with get_db() as db:
-            ids = db.execute("""
-                SELECT id FROM trial_lines
-                WHERE batch_id=? AND maker_id=?
-            """, (rows[0]["batch_id"], current_user_id())).fetchall()
-        for r in ids:
-            notify_maker_upload_support(r["id"])
-        st.success(f"Ingested {len(rows)} lines and notified makers ✅")
+        
