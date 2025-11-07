@@ -3,6 +3,7 @@ import pandas as pd
 from db import get_db
 from lib_ui import require_role, current_user_id
 from services import add_comment, get_all_comments, insert_trial_batch_new, approve_to_next_stage
+from mailjet_mailer import send_csv_uploaded_to_maker, send_maker_submitted_to_reviewer
 
 require_role("maker")
 st.title("📌 Maker Dashboard")
@@ -87,6 +88,17 @@ with tab1:
                 st.warning(f"⚠️ Trial balance is not zero! Current sum: {trial_balance:,.2f}")
             else:
                 st.success("✅ Trial balance is balanced (sum = 0)")
+            
+            # Send email to maker notifying CSV uploaded
+            try:
+                gl_summary = f"{len(df_mapped)} GL accounts"
+                status_code, response = send_csv_uploaded_to_maker(gl_summary)
+                if status_code in [200, 201]:
+                    st.success("📧 Email sent to maker")
+                else:
+                    st.warning(f"Email send issue: {response}")
+            except Exception as e:
+                st.warning(f"Email error (non-blocking): {e}")
             
             # Show items requiring comments
             items_needing_comment = df_mapped[df_mapped['requires_comment']]
@@ -339,7 +351,16 @@ with tab1:
                 for line in inserted_lines:
                     approve_to_next_stage(line['id'], current_user_id(), 'maker', reviewer_id)
                 
-                success_msg = f"✅ Successfully submitted {len(rows_to_insert)} items to reviewer!"
+                # Send email to reviewer
+                try:
+                    gl_summary = f"{len(rows_to_insert)} GL accounts"
+                    status_code, response = send_maker_submitted_to_reviewer(gl_summary)
+                    if status_code not in [200, 201]:
+                        st.warning(f"Email send issue: {response}")
+                except Exception as e:
+                    st.warning(f"Email error (non-blocking): {e}")
+                
+                success_msg = f"✅ Successfully submitted {len(rows_to_insert)} items to reviewer! 📧 Email sent."
                 if skipped_count > 0:
                     success_msg += f" ({skipped_count} GLs were disapproved and excluded)"
                 
