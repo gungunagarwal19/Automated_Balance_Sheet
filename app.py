@@ -37,7 +37,7 @@ with tab1:
                 if st.session_state.role == "maker":
                     st.switch_page("pages/maker_dashboard.py")
                 elif st.session_state.role == "reviewer":
-                    st.switch_page("pages/reviewer_dashboard.py")
+                    st.switch_page("pages/reviewer.py")
                 elif st.session_state.role == "fc":
                     st.switch_page("pages/fc_dashboard.py")
                 elif st.session_state.role == "cfo":

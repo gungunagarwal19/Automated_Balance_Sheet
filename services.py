@@ -162,3 +162,47 @@ def on_fc_approved(trial_line_id: int):
             subject=f"[Closed] GL {row['gl_account']} / {row['company_code']} approved by FC",
             html="Your GL item has been reviewed and approved by Business FC."
         )
+
+
+def record_rejection(trial_line_id: int, reason: str, user_id: int):
+    """Persist a rejection for a single trial line and mark its status as 'rejected'."""
+    with get_db() as db:
+        # fetch batch id for context
+        row = db.execute("SELECT batch_id FROM trial_lines WHERE id=?", (trial_line_id,)).fetchone()
+        batch_id = row['batch_id'] if row else None
+        db.execute("INSERT INTO rejections(trial_line_id, batch_id, reason, rejected_by) VALUES (?,?,?,?)",
+                   (trial_line_id, batch_id, reason, user_id))
+        db.execute("UPDATE trial_lines SET status='rejected' WHERE id=?", (trial_line_id,))
+
+
+def record_batch_rejection(batch_id: str, reason: str, user_id: int):
+    """Persist a rejection for all trial lines in a batch and mark them 'rejected'."""
+    with get_db() as db:
+        rows = db.execute("SELECT id FROM trial_lines WHERE batch_id=?", (batch_id,)).fetchall()
+        for r in rows:
+            db.execute("INSERT INTO rejections(trial_line_id, batch_id, reason, rejected_by) VALUES (?,?,?,?)",
+                       (r['id'], batch_id, reason, user_id))
+        db.execute("UPDATE trial_lines SET status='rejected' WHERE batch_id=?", (batch_id,))
+
+
+def set_gl_comment(trial_line_id: int, comment: str, user_id: int):
+    """Insert or update a single comment for a trial line. Any user can edit."""
+    with get_db() as db:
+        # try update
+        updated = db.execute("""
+            UPDATE gl_comments SET comment=?, updated_by=?, updated_at=(datetime('now'))
+            WHERE trial_line_id=?
+        """, (comment, user_id, trial_line_id)).rowcount
+        if not updated:
+            db.execute("""
+                INSERT INTO gl_comments(trial_line_id, comment, updated_by)
+                VALUES (?,?,?)
+            """, (trial_line_id, comment, user_id))
+
+
+def get_gl_comment(trial_line_id: int):
+    with get_db() as db:
+        row = db.execute("SELECT comment, updated_by, updated_at FROM gl_comments WHERE trial_line_id=?", (trial_line_id,)).fetchone()
+        if row:
+            return dict(row)
+        return None

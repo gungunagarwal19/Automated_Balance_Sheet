@@ -98,4 +98,23 @@ def init_db():
             path TEXT,
             uploaded_at TEXT DEFAULT (datetime('now'))
         );
+
+        -- One editable comment per trial line. Any user can edit; visible to all.
+        CREATE TABLE IF NOT EXISTS gl_comments(
+            id INTEGER PRIMARY KEY,
+            trial_line_id INTEGER UNIQUE REFERENCES trial_lines(id) ON DELETE CASCADE,
+            comment TEXT,
+            updated_by INTEGER REFERENCES users(id),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+
+        -- Rejections: record when a maker or reviewer rejects a trial line
+        CREATE TABLE IF NOT EXISTS rejections(
+            id INTEGER PRIMARY KEY,
+            trial_line_id INTEGER REFERENCES trial_lines(id) ON DELETE CASCADE,
+            batch_id TEXT,
+            reason TEXT,
+            rejected_by INTEGER REFERENCES users(id),
+            rejected_at TEXT DEFAULT (datetime('now'))
+        );
         """)
