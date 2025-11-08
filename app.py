@@ -33,15 +33,15 @@ with tab1:
                 st.session_state.role = row["role"]
                 st.success(f"✅ Logged in as {st.session_state.role.upper()}")
 
-                # Redirect based on role (use new dashboards)
+                # Redirect based on role
                 if st.session_state.role == "maker":
-                    st.switch_page("pages/maker_dashboard_new.py")
+                    st.switch_page("pages/maker_dashboard.py")
                 elif st.session_state.role == "reviewer":
-                    st.switch_page("pages/reviewer_new.py")
+                    st.switch_page("pages/reviewer.py")
                 elif st.session_state.role == "fc":
-                    st.switch_page("pages/fc_new.py")
+                    st.switch_page("pages/fc.py")
                 elif st.session_state.role == "cfo":
-                    st.switch_page("pages/cfo_new.py")
+                    st.switch_page("pages/cfo.py")
                 else:
                     st.info("Logged in — no specific dashboard configured for this role.")
             else:
