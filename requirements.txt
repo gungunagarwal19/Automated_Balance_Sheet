@@ -9,3 +9,4 @@ email-validator
 apscheduler
 pandas
 jinja2
+mailjet-rest

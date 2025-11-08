@@ -2,6 +2,7 @@ import streamlit as st
 from db import get_db
 from lib_ui import require_role, current_user_id
 from services import add_comment, get_all_comments, approve_to_next_stage, disapprove_to_previous_stage
+from mailjet_mailer import send_cfo_approved_to_maker
 
 require_role("cfo")
 st.title("👔 CFO Dashboard")
@@ -99,7 +100,15 @@ else:
                             # Final approval (no next user needed)
                             approve_to_next_stage(item['id'], current_user_id(), 'cfo', None)
                             
-                            st.success("✅ Final approval granted!")
+                            # Send approval email to maker
+                            try:
+                                status_code, response = send_cfo_approved_to_maker(item['gl_account'])
+                                if status_code not in [200, 201]:
+                                    st.warning(f"Email send issue: {response}")
+                            except Exception as e:
+                                st.warning(f"Email error (non-blocking): {e}")
+                            
+                            st.success("✅ Final approval granted! 📧 Approval email sent to maker.")
                             st.balloons()
                             st.rerun()
                         except Exception as e:

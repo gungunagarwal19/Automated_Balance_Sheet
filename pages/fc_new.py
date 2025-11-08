@@ -2,6 +2,7 @@ import streamlit as st
 from db import get_db
 from lib_ui import require_role, current_user_id
 from services import add_comment, get_all_comments, approve_to_next_stage, disapprove_to_previous_stage
+from mailjet_mailer import send_fc_to_cfo
 
 require_role("fc")
 st.title("💼 Financial Controller Dashboard")
@@ -102,7 +103,16 @@ else:
                             else:
                                 # Approve to CFO
                                 approve_to_next_stage(item['id'], current_user_id(), 'fc', cfo_id)
-                                st.success("✅ Approved and sent to CFO!")
+                                
+                                # Send email to CFO
+                                try:
+                                    status_code, response = send_fc_to_cfo(item['gl_account'])
+                                    if status_code not in [200, 201]:
+                                        st.warning(f"Email send issue: {response}")
+                                except Exception as e:
+                                    st.warning(f"Email error (non-blocking): {e}")
+                                
+                                st.success("✅ Approved and sent to CFO! 📧 Email sent.")
                                 st.rerun()
                         except Exception as e:
                             st.error(f"Error: {str(e)}")

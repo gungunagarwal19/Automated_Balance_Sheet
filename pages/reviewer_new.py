@@ -2,6 +2,7 @@ import streamlit as st
 from db import get_db
 from lib_ui import require_role, current_user_id
 from services import add_comment, get_all_comments, approve_to_next_stage, disapprove_to_previous_stage
+from mailjet_mailer import send_reviewer_to_fc
 
 require_role("reviewer")
 st.title("🔍 Reviewer Dashboard")
@@ -222,7 +223,16 @@ else:
                                 add_comment(item_id, comment, current_user_id(), 'reviewer')
                                 approve_to_next_stage(item_id, current_user_id(), 'reviewer', fc_id)
                         
-                        st.success(f"✅ Successfully submitted {selected_count} item(s) to FC!")
+                        # Send email to FC
+                        try:
+                            gl_summary = f"{selected_count} GL accounts"
+                            status_code, response = send_reviewer_to_fc(gl_summary)
+                            if status_code not in [200, 201]:
+                                st.warning(f"Email send issue: {response}")
+                        except Exception as e:
+                            st.warning(f"Email error (non-blocking): {e}")
+                        
+                        st.success(f"✅ Successfully submitted {selected_count} item(s) to FC! 📧 Email sent.")
                         
                         # Clear session state
                         st.session_state['reviewer_comments'] = {}
