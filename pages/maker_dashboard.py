@@ -1,414 +1,502 @@
 import streamlit as st
 import pandas as pd
 from db import get_db
-from lib_ui import require_role, store_attachment, current_user_id
-from services import on_user_uploaded_support, set_gl_comment, get_gl_comment
-from email_utiles import send_email
+from lib_ui import require_role, current_user_id
+from services import add_comment, get_all_comments, insert_trial_batch_new, approve_to_next_stage
+from mailjet_mailer import send_csv_uploaded_to_maker, send_maker_submitted_to_reviewer
 
 require_role("maker")
 st.title("📌 Maker Dashboard")
 
-# helper to find a likely email column name in uploaded dataframe
-def find_email_col(cols):
-    for c in cols:
-        if any(k in c.lower() for k in ("email", "e-mail", "contact", "from", "sender")):
-            return c
-    return None
-
-tab1, tab2 = st.tabs(["My pending GLs", "Upload NON-SAP trial"])
+tab1, tab2 = st.tabs(["Upload Trial Balance CSV", "My Pending Items"])
 
 with tab1:
-    with get_db() as db:
-        items = db.execute("""
-            SELECT tl.id, tl.company_code, tl.gl_account, tl.gl_description, tl.status, tl.batch_id, tl.reviewer_id
-            FROM trial_lines tl
-            WHERE tl.maker_id=?
-            ORDER BY tl.created_at DESC
-        """, (current_user_id(),)).fetchall()
-
-    for it in items:
-        approved = True if it['status'] in ('reviewed','fc_approved') else False
-        header = f"{it['company_code']} • GL {it['gl_account']} — {it['gl_description']}"
-        if approved:
-            header = header + "  ✅ Approved by Checker"
-        else:
-            header = header + f"  (status: {it['status']})"
-        with st.expander(header):
-            f = st.file_uploader("Upload supporting / backup working file", key=f"up_{it['id']}")
-            reviewer_id = st.number_input("Assign Reviewer (user id)", min_value=1, step=1,
-                                          key=f"rev_{it['id']}")
-            st.write(f"Batch: {it.get('batch_id')}  •  Reviewer: {it.get('reviewer_id')} ")
-            # Comment section (editable by anyone and visible to all)
-            existing = get_gl_comment(it['id'])
-            existing_text = existing['comment'] if existing and existing.get('comment') else ""
-            comment_text = st.text_area("Comment (visible to all)", value=existing_text, key=f"cm_{it['id']}")
-            if st.button("Save Comment", key=f"savec_{it['id']}"):
-                set_gl_comment(it['id'], comment_text, current_user_id())
-                st.success("Saved comment")
-            if f and st.button("Submit Support", key=f"btn_{it['id']}"):
-                store_attachment(it["id"], f)
-                on_user_uploaded_support(it["id"], reviewer_id)
-                st.success("Uploaded and sent to Reviewer ✅")
-
-            # Per-GL reject button: allow maker to reject a single GL and notify source/admins
-            if st.button("Reject GL — Notify Source", key=f"reject_gl_{it['id']}"):
-                st.session_state[f"reject_gl_open_{it['id']}"] = True
-
-            if st.session_state.get(f"reject_gl_open_{it['id']}", False):
-                rej_reason = st.text_area("Reason for rejecting this GL (will be emailed to source)", key=f"rej_reason_{it['id']}")
-                if st.button("Send Rejection Email for GL", key=f"send_rej_gl_{it['id']}"):
-                    # find source email from trial_lines.source or fallback to admins
-                    recipients = set()
-                    # try to locate a source email stored on the trial line
-                    try:
-                        with get_db() as db:
-                            row = db.execute("SELECT source, batch_id, company_code, gl_account FROM trial_lines WHERE id=?", (it['id'],)).fetchone()
-                        if row and row.get('source') and isinstance(row.get('source'), str) and '@' in row.get('source'):
-                            recipients.add(row.get('source'))
-                    except Exception:
-                        pass
-
-                    # fallback to admins if no recipients found
-                    if not recipients:
-                        with get_db() as db:
-                            admins = db.execute("SELECT email FROM users WHERE role='admin'").fetchall()
-                        for a in admins:
-                            if a and a.get('email'):
-                                recipients.add(a['email'])
-
-                    if not recipients:
-                        st.error("No recipient email found (no source email or admin configured). Cannot send rejection email.")
-                    else:
-                        # persist rejection and update status
-                        from services import record_rejection
-                        try:
-                            record_rejection(it['id'], rej_reason, current_user_id())
-                        except Exception:
-                            pass
-                        to_list = ",".join(recipients)
-                        subject = f"[Rejection] GL {it['gl_account']} / {it['company_code']} — Balance sheet not appropriate"
-                        body = f"The following GL has been rejected by the maker.\n\nGL: {it['gl_account']}\nCompany: {it['company_code']}\nReason provided:\n{rej_reason}\n\nPlease review — the balance is not appropriate."
-                        try:
-                            send_email(to_list, subject, body)
-                            st.success(f"Rejection email sent to: {to_list}")
-                            st.session_state[f"reject_gl_open_{it['id']}"] = False
-                        except Exception as e:
-                            st.error(f"Error sending email: {str(e)}")
-
-with tab2:
-    st.write("Upload NON-SAP trial data. You can map your columns to our required fields.")
+    st.write("### Upload Trial Balance CSV")
+    st.info("Upload a CSV file with columns: `prev_amount` and `curr_amount`. System will calculate variance and flag items > 30%")
     
-    f = st.file_uploader("Upload NON-SAP Trial CSV/XLSX", type=["csv","xlsx"])
-    if f:
-        df = pd.read_csv(f) if f.name.endswith(".csv") else pd.read_excel(f)
-        if df.empty:
-            st.error("File appears to be empty")
-            st.stop()
-            
-        st.write("Preview of your data:")
-        st.dataframe(df.head())
+    uploaded_file = st.file_uploader("Choose CSV file", type=['csv', 'xlsx'])
+    
+    if uploaded_file:
+        # Read the file
+        if uploaded_file.name.endswith('.csv'):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
         
-        # Show available columns
-        st.write("### Map Your Columns")
-        st.write("Select which of your columns correspond to the required fields: current amount, previous amount, company and GL.")
-
-        def find_best_match(cols, keywords):
+        st.write("### Preview of uploaded data:")
+        st.dataframe(df.head(10))
+        
+        # Column mapping
+        st.write("### Map your columns")
+        cols = list(df.columns)
+        
+        # Auto-detect or let user select
+        def find_col(keywords):
             for col in cols:
                 if any(k.lower() in col.lower() for k in keywords):
                     return col
-            return None
-
-        company_col = st.selectbox("Company Code Column", options=[""] + list(df.columns),
-                                   index=0 if not find_best_match(df.columns, ["company", "comp", "entity"]) else list(df.columns).index(find_best_match(df.columns, ["company", "comp", "entity"])) + 1)
-
-        gl_col = st.selectbox("GL Account Column", options=[""] + list(df.columns),
-                              index=0 if not find_best_match(df.columns, ["gl", "account", "acc"]) else list(df.columns).index(find_best_match(df.columns, ["gl", "account", "acc"])) + 1)
-
-        current_col = st.selectbox("Current Amount Column", options=[""] + list(df.columns),
-                                   index=0 if not find_best_match(df.columns, ["current", "this", "amount"]) else list(df.columns).index(find_best_match(df.columns, ["current", "this", "amount"])) + 1)
-
-        previous_col = st.selectbox("Previous Amount Column", options=["[Skip]"] + list(df.columns),
-                                    index=0 if not find_best_match(df.columns, ["previous", "prior", "last"]) else list(df.columns).index(find_best_match(df.columns, ["previous", "prior", "last"])) + 1)
+            return cols[0] if cols else None
         
-        if st.button("Prepare Trial for Checker"):
-            if not all([company_col, gl_col, current_col]):
-                st.error("❌ Please map required fields: Company, GL, Current Amount")
-                st.stop()
-
-            # Create new dataframe with mapped columns
-            mapped_df = pd.DataFrame()
-            mapped_df['company_code'] = df[company_col] if company_col else None
-            mapped_df['gl_account'] = df[gl_col] if gl_col else None
-            mapped_df['current_amount'] = df[current_col] if current_col else 0.0
-            if previous_col and previous_col != "[Skip]":
-                mapped_df['previous_amount'] = df[previous_col]
-            else:
-                mapped_df['previous_amount'] = 0.0
-            # normalize numeric columns
-            mapped_df['current_amount'] = pd.to_numeric(mapped_df['current_amount'].astype(str).str.replace(',',''), errors='coerce').fillna(0.0)
-            mapped_df['previous_amount'] = pd.to_numeric(mapped_df['previous_amount'].astype(str).str.replace(',',''), errors='coerce').fillna(0.0)
-
-            # (No sign adjustments or optional fields required in this simplified flow)
+        col_company = st.selectbox("Company Code", options=cols, 
+                                   index=cols.index(find_col(['company', 'comp', 'entity'])) if find_col(['company', 'comp', 'entity']) else 0)
+        
+        col_gl = st.selectbox("GL Account", options=cols,
+                             index=cols.index(find_col(['gl', 'account', 'ledger'])) if find_col(['gl', 'account', 'ledger']) else 0)
+        
+        col_prev = st.selectbox("Previous Amount", options=cols,
+                               index=cols.index(find_col(['prev', 'previous', 'prior', 'last'])) if find_col(['prev', 'previous', 'prior', 'last']) else 0)
+        
+        col_curr = st.selectbox("Current Amount", options=cols,
+                               index=cols.index(find_col(['curr', 'current', 'present', 'this'])) if find_col(['curr', 'current', 'present', 'this']) else 0)
+        
+        col_desc = st.selectbox("GL Description (Optional)", options=['[Skip]'] + cols, index=0)
+        
+        # Variance threshold
+        variance_threshold = st.number_input("Variance Threshold (%)", value=30.0, min_value=0.0, max_value=100.0, step=5.0,
+                                            help="Items with variance >= this % will require comments")
+        
+        if st.button("Process & Calculate Variance"):
+            # Create mapped dataframe
+            df_mapped = pd.DataFrame()
+            df_mapped['company_code'] = df[col_company].astype(str)
+            df_mapped['gl_account'] = df[col_gl].astype(str)
+            df_mapped['gl_description'] = df[col_desc] if col_desc != '[Skip]' else ''
             
-            # Add remaining required fields for insertion
-            mapped_df["source"] = "NON_SAP"
-            mapped_df["batch_id"] = "manual_" + pd.Timestamp.now().strftime("%Y%m%d%H%M%S")
-
-            # calculate trial total (do not error; just show)
-            total_sum = float(mapped_df['current_amount'].sum())
-            st.info(f"Trial total (sum of current amounts): {total_sum}")
-
-            # If trial total > 0 allow maker to reject and notify source
-            batch_id = mapped_df.loc[0, 'batch_id'] if 'batch_id' in mapped_df.columns else None
-            if total_sum > 0:
-                st.warning("Trial total is greater than zero. You may reject this batch and notify the data source if appropriate.")
-                reject_key = f"reject_btn_{batch_id}"
-                if st.button("Reject Trial — Notify Source", key=reject_key):
-                    st.session_state[f"reject_open_{batch_id}"] = True
-
-                if st.session_state.get(f"reject_open_{batch_id}", False):
-                    reason = st.text_area("Reason for rejection (this will be sent to the source)", key=f"reject_reason_{batch_id}")
-                    if st.button("Send Rejection Email", key=f"send_rej_{batch_id}"):
-                        # find potential recipient emails from uploaded dataframe
-                        recipients = set()
-                        # try to locate an email-like column
-                        def find_email_col(cols):
-                            for c in cols:
-                                if any(k in c.lower() for k in ("email","e-mail","contact","from","sender")):
-                                    return c
-                            return None
-
-                        email_col = find_email_col(list(df.columns))
-                        if email_col:
-                            try:
-                                for val in df[email_col].dropna().astype(str).unique().tolist():
-                                    if "@" in val:
-                                        recipients.add(val)
-                            except Exception:
-                                pass
-
-                        # also check mapped source field
-                        if 'source' in mapped_df.columns:
-                            s = mapped_df.loc[0, 'source']
-                            if isinstance(s, str) and '@' in s:
-                                recipients.add(s)
-
-                        # fallback: notify admins if no source email found
-                        if not recipients:
-                            with get_db() as db:
-                                admins = db.execute("SELECT email FROM users WHERE role='admin'").fetchall()
-                            for a in admins:
-                                if a and a.get('email'):
-                                    recipients.add(a['email'])
-
-                        if not recipients:
-                            st.error("No recipient email found (no source email or admin configured). Cannot send rejection email.")
-                        else:
-                            # persist rejection for batch and notify recipients
-                            from services import record_batch_rejection
-                            try:
-                                record_batch_rejection(batch_id, reason, current_user_id())
-                            except Exception:
-                                pass
-                            to_list = ",".join(recipients)
-                            subject = f"[Rejection] Batch {batch_id or '(unknown)'} — Balance sheet not appropriate"
-                            body = f"The following batch has been rejected by the maker.\n\nBatch: {batch_id}\nTrial total: {total_sum}\n\nReason provided:\n{reason}\n\nPlease review — the balance sheet is not appropriate."
-                            try:
-                                send_email(to_list, subject, body)
-                                st.success(f"Rejection email sent to: {to_list}")
-                                # close the reject box
-                                st.session_state[f"reject_open_{batch_id}"] = False
-                            except Exception as e:
-                                st.error(f"Error sending email: {str(e)}")
-
-            # Compute actual variation percent per row
-            def compute_variation_pct(curr, prev):
-                try:
-                    curr = float(curr)
-                    prev = float(prev)
-                except Exception:
-                    return 0.0
+            # Convert amounts to numeric
+            df_mapped['prev_amount'] = pd.to_numeric(df[col_prev].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0)
+            df_mapped['curr_amount'] = pd.to_numeric(df[col_curr].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0)
+            
+            # Calculate variance percentage
+            def calc_variance(row):
+                prev = row['prev_amount']
+                curr = row['curr_amount']
                 if abs(prev) < 1e-9:
                     if abs(curr) < 1e-9:
                         return 0.0
-                    return float('inf')
-                return abs((curr - prev) / prev) * 100.0
-
-            mapped_df['actual_variation_pct'] = mapped_df.apply(lambda r: compute_variation_pct(r['current_amount'], r['previous_amount']), axis=1)
-        
-            # Show preview of mapped data
-            st.write("### Preview of Mapped Data")
-            st.dataframe(mapped_df[['company_code','gl_account','current_amount','previous_amount','actual_variation_pct']].head())
-
-            # Single allowed variation (applies to all rows) and show only rows meeting/exceeding it
-            st.write("### Review variations and add comments where needed")
-            allowed_batch = st.number_input("Allowed variation % for this batch", value=35.0, step=0.1, help="If actual variation for a row is >= this percent (or infinite), it will be shown here and a reason required.")
-            # build mask of rows exceeding or equal to allowed_batch
-            def exceeds_allowed(r):
-                actual = r['actual_variation_pct']
-                try:
-                    # treat infinite as exceeding
-                    if actual == float('inf'):
-                        return True
-                    return float(actual) >= float(allowed_batch)
-                except Exception:
-                    return False
-
-            df_reset = mapped_df.reset_index()
-            flagged = df_reset[df_reset.apply(exceeds_allowed, axis=1)]
-
-            if flagged.empty:
-                st.info("No rows meet or exceed the allowed variation — nothing to review for variation reasons.")
-                # still allow sending all rows to checker without extra comments
-                if st.button("Send All to Checker"):
-                    try:
-                        rows_to_insert = []
-                        for i, r in mapped_df.iterrows():
-                            rows_to_insert.append({
-                                'company_code': r['company_code'],
-                                'gl_account': r['gl_account'],
-                                'gl_description': '',
-                                'amount': float(r['current_amount']),
-                                'currency': 'INR',
-                                'cost_center': '',
-                                'profit_center': '',
-                                'text': '',
-                                'reference': '',
-                                'fs_group': '',
-                            })
-                        from services import insert_trial_batch
-                        insert_trial_batch(rows_to_insert, mapped_df.loc[0, 'batch_id'], 'NON_SAP')
-                        # forward to reviewer
-                        with get_db() as db:
-                            ids = db.execute("SELECT id, reviewer_id FROM trial_lines WHERE batch_id=? AND maker_id=?",
-                                             (mapped_df.loc[0, 'batch_id'], current_user_id())).fetchall()
-                        for r in ids:
-                            try:
-                                on_user_uploaded_support(r['id'], r.get('reviewer_id'))
-                            except Exception:
-                                pass
-                        st.success(f"✅ Sent {len(rows_to_insert)} lines to reviewer for checking")
-                    except Exception as e:
-                        st.error(f"Error sending to checker: {str(e)}")
-            else:
-                st.write(f"{len(flagged)} rows meet or exceed the allowed variation ({allowed_batch}%). Please provide reasons for these rows before sending to checker.")
-                variation_inputs = []
-                missing_comments = False
-                for idx, row in flagged.iterrows():
-                    col_a, col_b, col_c = st.columns([2,2,4])
-                    with col_a:
-                        st.write(f"{row['company_code']} • {row['gl_account']}")
-                    with col_b:
-                        st.write(f"Actual var: {row['actual_variation_pct'] if row['actual_variation_pct']!=float('inf') else '∞'}%")
-                        with col_c:
-                            comment_val = st.text_area("Please enter reason for variation", key=f"var_comment_{row['index']}")
-                            if not comment_val or comment_val.strip() == "":
-                                missing_comments = True
-                            variation_inputs.append({'idx': row['index'], 'comment': comment_val})
-
-                            # Per-GL reject for flagged rows
-                            if st.button("Reject GL — Notify Source", key=f"reject_flag_{row['index']}"):
-                                st.session_state[f"reject_flag_open_{row['index']}"] = True
-
-                            if st.session_state.get(f"reject_flag_open_{row['index']}", False):
-                                flag_reason = st.text_area("Reason for rejecting this GL (will be emailed to source)", key=f"flag_rej_reason_{row['index']}")
-                                if st.button("Send Rejection Email for GL", key=f"send_flag_rej_{row['index']}"):
-                                    recipients = set()
-                                    # try to find email in uploaded df for this row
-                                    try:
-                                        email_col = find_email_col(list(df.columns))
-                                        if email_col:
-                                            val = df.iloc[row['index']][email_col]
-                                            if isinstance(val, str) and '@' in val:
-                                                recipients.add(val)
-                                    except Exception:
-                                        pass
-
-                                    # also check mapped source
-                                    try:
-                                        s = mapped_df.loc[row['index'], 'source'] if 'source' in mapped_df.columns else None
-                                        if isinstance(s, str) and '@' in s:
-                                            recipients.add(s)
-                                    except Exception:
-                                        pass
-
-                                    if not recipients:
-                                        with get_db() as db:
-                                            admins = db.execute("SELECT email FROM users WHERE role='admin'").fetchall()
-                                        for a in admins:
-                                            if a and a.get('email'):
-                                                recipients.add(a['email'])
-
-                                    if not recipients:
-                                        st.error("No recipient email found (no source email or admin configured). Cannot send rejection email.")
-                                    else:
-                                        to_list = ",".join(recipients)
-                                        subject = f"[Rejection] GL {mapped_df.loc[row['index'],'gl_account']} / {mapped_df.loc[row['index'],'company_code']} — Balance sheet not appropriate"
-                                        body = f"The following GL has been rejected by the maker.\n\nGL: {mapped_df.loc[row['index'],'gl_account']}\nCompany: {mapped_df.loc[row['index'],'company_code']}\nReason provided:\n{flag_reason}\n\nPlease review — the balance is not appropriate."
-                                        try:
-                                            send_email(to_list, subject, body)
-                                            st.success(f"Rejection email sent to: {to_list}")
-                                            st.session_state[f"reject_flag_open_{row['index']}"] = False
-                                        except Exception as e:
-                                            st.error(f"Error sending email: {str(e)}")
-
-                if missing_comments:
-                    st.warning("Some flagged rows are missing reasons. Please add comments before sending to checker.")
-
-                if st.button("Send Flagged to Checker"):
-                    if missing_comments:
-                        st.error("Please provide required comments for flagged variations before sending to checker.")
                     else:
-                        try:
-                            # prepare rows for insertion (use current_amount as amount)
-                            rows_to_insert = []
-                            for i, r in mapped_df.iterrows():
-                                rows_to_insert.append({
-                                    'company_code': r['company_code'],
-                                    'gl_account': r['gl_account'],
-                                    'gl_description': '',
-                                    'amount': float(r['current_amount']),
-                                    'currency': 'INR',
-                                    'cost_center': '',
-                                    'profit_center': '',
-                                    'text': '',
-                                    'reference': '',
-                                    'fs_group': '',
-                                })
-
-                            from services import insert_trial_batch
-                            insert_trial_batch(rows_to_insert, mapped_df.loc[0, 'batch_id'], 'NON_SAP')
-
-                            # fetch newly inserted ids for the batch and set comments if present
-                            with get_db() as db:
-                                new_rows = db.execute("SELECT id, company_code, gl_account FROM trial_lines WHERE batch_id=? AND maker_id=?",
-                                                      (mapped_df.loc[0, 'batch_id'], current_user_id())).fetchall()
-                            # map back by company+gl (best-effort) and save comments only for flagged rows
-                            for vi in variation_inputs:
-                                cidx = vi['idx']
-                                comp = mapped_df.reset_index().loc[cidx, 'company_code']
-                                gl = mapped_df.reset_index().loc[cidx, 'gl_account']
-                                comment = vi.get('comment')
-                                if comment and comment.strip():
-                                    match = None
-                                    for nr in new_rows:
-                                        if nr['company_code'] == comp and nr['gl_account'] == gl:
-                                            match = nr
-                                            break
-                                    if match:
-                                        set_gl_comment(match['id'], comment, current_user_id())
-
-                            # forward to reviewer (notify)
-                            with get_db() as db:
-                                ids = db.execute("SELECT id, reviewer_id FROM trial_lines WHERE batch_id=? AND maker_id=?",
-                                                 (mapped_df.loc[0, 'batch_id'], current_user_id())).fetchall()
-                            for r in ids:
-                                try:
-                                    on_user_uploaded_support(r['id'], r.get('reviewer_id'))
-                                except Exception:
-                                    pass
-                            st.success(f"✅ Sent {len(rows_to_insert)} lines to reviewer for checking")
-                        except Exception as e:
-                            st.error(f"Error sending to checker: {str(e)}")
-
+                        return 100.0  # Treat as 100% variance
+                return abs((curr - prev) / prev) * 100.0
+            
+            df_mapped['variance_pct'] = df_mapped.apply(calc_variance, axis=1)
+            df_mapped['requires_comment'] = df_mapped['variance_pct'] >= variance_threshold
+            
+            # Calculate trial balance
+            trial_balance = df_mapped['curr_amount'].sum()
+            st.metric("Trial Balance (Sum of Current Amounts)", f"{trial_balance:,.2f}")
+            
+            if abs(trial_balance) > 0.01:
+                st.warning(f"⚠️ Trial balance is not zero! Current sum: {trial_balance:,.2f}")
+            else:
+                st.success("✅ Trial balance is balanced (sum = 0)")
+            
+            # Send email to maker notifying CSV uploaded
+            try:
+                gl_summary = f"{len(df_mapped)} GL accounts"
+                status_code, response = send_csv_uploaded_to_maker(gl_summary)
+                if status_code in [200, 201]:
+                    st.success("📧 Email sent to maker")
+                else:
+                    st.warning(f"Email send issue: {response}")
+            except Exception as e:
+                st.warning(f"Email error (non-blocking): {e}")
+            
+            # Show items requiring comments
+            items_needing_comment = df_mapped[df_mapped['requires_comment']]
+            
+            st.write(f"### Items requiring comment ({len(items_needing_comment)} items with variance >= {variance_threshold}%)")
+            
+            if len(items_needing_comment) > 0:
+                st.dataframe(items_needing_comment[['company_code', 'gl_account', 'gl_description', 
+                                                    'prev_amount', 'curr_amount', 'variance_pct']])
+                
+                # Store in session state for commenting
+                st.session_state['df_mapped'] = df_mapped
+                st.session_state['items_needing_comment'] = items_needing_comment
+                st.session_state['variance_threshold'] = variance_threshold
+                
+                st.info("👇 Please add comments for high-variance items below")
+            else:
+                st.success("No items require comments. You can proceed to submit.")
+                st.session_state['df_mapped'] = df_mapped
+                st.session_state['items_needing_comment'] = items_needing_comment
+                st.session_state['variance_threshold'] = variance_threshold
+    
+    # Comment input section
+    if 'items_needing_comment' in st.session_state and st.session_state['items_needing_comment'] is not None:
+        items_needing_comment = st.session_state['items_needing_comment']
+        df_mapped = st.session_state['df_mapped']
         
+        if len(items_needing_comment) > 0:
+            st.write("### Add Comments for High Variance Items")
+            
+            # Initialize comments storage in session state
+            if 'maker_comments' not in st.session_state:
+                st.session_state['maker_comments'] = {}
+            
+            # Sample comments for quick testing
+            sample_comments = [
+                "Increased due to new customer acquisitions and expanded market reach",
+                "Higher operating expenses due to inflation and new hiring",
+                "Additional depreciation from new equipment purchases",
+                "Seasonal revenue increase aligned with Q4 projections",
+                "Cost reduction initiative implemented successfully",
+                "One-time adjustment for prior period correction",
+                "Foreign exchange fluctuation impact",
+                "Restructuring costs included in this period"
+            ]
+            
+            for idx, row in items_needing_comment.iterrows():
+                with st.expander(f"GL {row['gl_account']} - {row['gl_description']} (Variance: {row['variance_pct']:.2f}%)"):
+                    col1, col2 = st.columns([3, 1])
+                    
+                    with col1:
+                        st.write(f"**Company:** {row['company_code']}")
+                        st.write(f"**Previous Amount:** {row['prev_amount']:,.2f}")
+                        st.write(f"**Current Amount:** {row['curr_amount']:,.2f}")
+                        st.write(f"**Variance:** {row['variance_pct']:.2f}%")
+                    
+                    with col2:
+                        # Quick fill with sample comment
+                        if st.button("📝 Sample", key=f"sample_{idx}", help="Fill with sample comment"):
+                            import random
+                            st.session_state['maker_comments'][f"{row['company_code']}_{row['gl_account']}"] = random.choice(sample_comments)
+                            st.rerun()
+                    
+                    comment_key = f"{row['company_code']}_{row['gl_account']}"
+                    comment = st.text_area(
+                        "Justify this variance:", 
+                        key=f"comment_{idx}",
+                        value=st.session_state['maker_comments'].get(comment_key, ""),
+                        placeholder="Explain the reason for this variance... (or click 'Sample' for quick test)"
+                    )
+                    st.session_state['maker_comments'][comment_key] = comment
+                    
+                    # Option to disapprove individual ledger
+                    st.write("---")
+                    if st.button(f"❌ Disapprove GL {row['gl_account']}", key=f"disapprove_gl_{idx}"):
+                        st.session_state[f'disapprove_gl_{idx}'] = True
+                    
+                    if st.session_state.get(f'disapprove_gl_{idx}', False):
+                        disapprove_reason = st.text_area(
+                            "Why disapprove this GL?",
+                            key=f"disapprove_reason_{idx}",
+                            placeholder="This ledger is incorrect/inappropriate because..."
+                        )
+                        if st.button("Confirm Disapproval", key=f"confirm_disapprove_{idx}"):
+                            if disapprove_reason.strip():
+                                # Mark this GL for disapproval
+                                if 'disapproved_gls' not in st.session_state:
+                                    st.session_state['disapproved_gls'] = {}
+                                st.session_state['disapproved_gls'][comment_key] = disapprove_reason
+                                st.success(f"✅ GL {row['gl_account']} marked for disapproval")
+                                st.session_state[f'disapprove_gl_{idx}'] = False
+                                st.rerun()
+                            else:
+                                st.error("Please provide a reason for disapproval")
+        
+        # Submit to reviewer
+        st.write("---")
+        st.write("### Submit to Reviewer")
+        
+        # Quick actions
+        col_action1, col_action2 = st.columns(2)
+        
+        with col_action1:
+            if len(items_needing_comment) > 0:
+                if st.button("🚀 Fill All with Sample Comments", help="Quickly fill all high-variance items with sample comments"):
+                    import random
+                    sample_comments = [
+                        "Increased due to new customer acquisitions and expanded market reach",
+                        "Higher operating expenses due to inflation and new hiring",
+                        "Additional depreciation from new equipment purchases",
+                        "Seasonal revenue increase aligned with Q4 projections",
+                        "Cost reduction initiative implemented successfully",
+                        "One-time adjustment for prior period correction",
+                        "Foreign exchange fluctuation impact",
+                        "Restructuring costs included in this period"
+                    ]
+                    for idx, row in items_needing_comment.iterrows():
+                        comment_key = f"{row['company_code']}_{row['gl_account']}"
+                        if not st.session_state['maker_comments'].get(comment_key, "").strip():
+                            st.session_state['maker_comments'][comment_key] = random.choice(sample_comments)
+                    st.success("✅ All comments filled with samples!")
+                    st.rerun()
+        
+        with col_action2:
+            # Option to disapprove entire trial balance
+            if st.button("❌ Disapprove Entire Trial Balance", help="Reject all items in this upload"):
+                st.session_state['disapprove_trial_balance'] = True
+        
+        # Handle trial balance disapproval
+        if st.session_state.get('disapprove_trial_balance', False):
+            st.error("⚠️ You are about to disapprove the ENTIRE trial balance")
+            trial_disapprove_reason = st.text_area(
+                "Reason for disapproving entire trial balance:",
+                key="trial_disapprove_reason",
+                placeholder="e.g., Trial balance not zero, data quality issues, wrong period uploaded..."
+            )
+            
+            col_cancel, col_confirm = st.columns(2)
+            with col_cancel:
+                if st.button("Cancel"):
+                    st.session_state['disapprove_trial_balance'] = False
+                    st.rerun()
+            
+            with col_confirm:
+                if st.button("⚠️ CONFIRM: Disapprove Entire Trial", type="primary"):
+                    if not trial_disapprove_reason.strip():
+                        st.error("Please provide a reason for disapproval")
+                    else:
+                        st.warning(f"✅ Trial balance disapproved: {trial_disapprove_reason}")
+                        st.info("This trial balance will not be submitted. You can upload a corrected version.")
+                        # Clear session state
+                        if 'df_mapped' in st.session_state:
+                            del st.session_state['df_mapped']
+                        if 'items_needing_comment' in st.session_state:
+                            del st.session_state['items_needing_comment']
+                        if 'maker_comments' in st.session_state:
+                            del st.session_state['maker_comments']
+                        st.session_state['disapprove_trial_balance'] = False
+                        st.rerun()
+            st.stop()  # Stop further processing if disapproving
+        
+        # Check for individually disapproved GLs
+        disapproved_gls_list = list(st.session_state.get('disapproved_gls', {}).keys()) if 'disapproved_gls' in st.session_state else []
+        if disapproved_gls_list:
+            st.warning(f"⚠️ {len(disapproved_gls_list)} GL(s) marked for disapproval and will be excluded from submission")
+        
+        # Check if all required comments are provided
+        all_comments_provided = True
+        if len(items_needing_comment) > 0:
+            for idx, row in items_needing_comment.iterrows():
+                comment_key = f"{row['company_code']}_{row['gl_account']}"
+                # Skip if this GL is disapproved
+                if comment_key in disapproved_gls_list:
+                    continue
+                if not st.session_state['maker_comments'].get(comment_key, "").strip():
+                    all_comments_provided = False
+                    break
+        
+        if not all_comments_provided:
+            st.warning("⚠️ Please provide comments for all high-variance items before submitting")
+        
+        if st.button("Submit to Reviewer", disabled=not all_comments_provided, type="primary"):
+            try:
+                # Generate batch ID
+                batch_id = f"batch_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
+                
+                # Get list of disapproved GLs
+                disapproved_gls_list = list(st.session_state.get('disapproved_gls', {}).keys()) if 'disapproved_gls' in st.session_state else []
+                
+                # Prepare rows for insertion (exclude disapproved GLs)
+                rows_to_insert = []
+                skipped_count = 0
+                
+                for idx, row in df_mapped.iterrows():
+                    gl_key = f"{row['company_code']}_{row['gl_account']}"
+                    
+                    # Skip disapproved GLs
+                    if gl_key in disapproved_gls_list:
+                        skipped_count += 1
+                        st.info(f"⏭️ Skipped disapproved GL: {row['gl_account']} - {st.session_state['disapproved_gls'][gl_key]}")
+                        continue
+                    
+                    rows_to_insert.append({
+                        'company_code': row['company_code'],
+                        'gl_account': row['gl_account'],
+                        'gl_description': row['gl_description'],
+                        'prev_amount': float(row['prev_amount']),
+                        'curr_amount': float(row['curr_amount']),
+                        'currency': 'INR',
+                        'doc_no': '',
+                        'posting_date': pd.Timestamp.now().strftime('%Y-%m-%d'),
+                        'cost_center': '',
+                        'profit_center': '',
+                        'text': '',
+                        'reference': ''
+                    })
+                
+                if not rows_to_insert:
+                    st.error("No items to submit - all GLs were disapproved")
+                    st.stop()
+                
+                # Insert batch
+                insert_trial_batch_new(rows_to_insert, batch_id, 'NON_SAP', current_user_id())
+                
+                # Add comments for high variance items (excluding disapproved)
+                with get_db() as db:
+                    inserted_lines = db.execute("""
+                        SELECT id, company_code, gl_account 
+                        FROM trial_lines 
+                        WHERE batch_id = ? AND maker_id = ?
+                    """, (batch_id, current_user_id())).fetchall()
+                
+                for line in inserted_lines:
+                    comment_key = f"{line['company_code']}_{line['gl_account']}"
+                    comment = st.session_state['maker_comments'].get(comment_key, "")
+                    
+                    if comment.strip():
+                        add_comment(line['id'], comment, current_user_id(), 'maker')
+                
+                # Approve all items to reviewer (auto-assign to any reviewer)
+                with get_db() as db:
+                    # Get first available reviewer
+                    reviewer = db.execute("SELECT id FROM users WHERE role='reviewer' LIMIT 1").fetchone()
+                    reviewer_id = reviewer['id'] if reviewer else None
+                
+                if not reviewer_id:
+                    st.error("No reviewer found in system. Please create a reviewer user.")
+                    st.stop()
+                
+                for line in inserted_lines:
+                    approve_to_next_stage(line['id'], current_user_id(), 'maker', reviewer_id)
+                
+                # Send email to reviewer
+                try:
+                    gl_summary = f"{len(rows_to_insert)} GL accounts"
+                    status_code, response = send_maker_submitted_to_reviewer(gl_summary)
+                    if status_code not in [200, 201]:
+                        st.warning(f"Email send issue: {response}")
+                except Exception as e:
+                    st.warning(f"Email error (non-blocking): {e}")
+                
+                success_msg = f"✅ Successfully submitted {len(rows_to_insert)} items to reviewer! 📧 Email sent."
+                if skipped_count > 0:
+                    success_msg += f" ({skipped_count} GLs were disapproved and excluded)"
+                
+                st.success(success_msg)
+                
+                # Clear session state
+                del st.session_state['df_mapped']
+                del st.session_state['items_needing_comment']
+                del st.session_state['maker_comments']
+                if 'disapproved_gls' in st.session_state:
+                    del st.session_state['disapproved_gls']
+                
+                st.rerun()
+                
+            except Exception as e:
+                st.error(f"Error submitting to reviewer: {str(e)}")
+
+with tab2:
+    st.write("### Items Returned for Revision")
+    
+    # Show items that were disapproved and sent back to maker
+    with get_db() as db:
+        disapproved_items = db.execute("""
+            SELECT tl.id, tl.company_code, tl.gl_account, tl.gl_description,
+                   tl.prev_amount, tl.curr_amount, tl.variance_pct, tl.status,
+                   tl.current_stage, tl.batch_id
+            FROM trial_lines tl
+            WHERE tl.maker_id = ? AND tl.status = 'awaiting_maker'
+            ORDER BY tl.created_at DESC
+        """, (current_user_id(),)).fetchall()
+    
+    if not disapproved_items:
+        st.info("No items pending. All items have been submitted to reviewer.")
+    else:
+        st.write(f"Found {len(disapproved_items)} items requiring your action:")
+        
+        # Option to disapprove specific item permanently
+        st.info("💡 Tip: You can also choose to disapprove any item permanently if you believe it shouldn't be in the trial balance.")
+        
+        for item in disapproved_items:
+            with st.expander(f"GL {item['gl_account']} - {item['gl_description']} (Variance: {item['variance_pct']:.2f}%)"):
+                st.write(f"**Company:** {item['company_code']}")
+                st.write(f"**Previous Amount:** {item['prev_amount']:,.2f}")
+                st.write(f"**Current Amount:** {item['curr_amount']:,.2f}")
+                st.write(f"**Variance:** {item['variance_pct']:.2f}%")
+                st.write(f"**Status:** {item['status']}")
+                st.write(f"**Batch:** {item['batch_id']}")
+                
+                # Show all comments in the chain
+                st.write("---")
+                st.write("**Comment History:**")
+                comments = get_all_comments(item['id'])
+                
+                if comments:
+                    for comm in comments:
+                        role_emoji = {
+                            'maker': '👷',
+                            'reviewer': '🔍',
+                            'fc': '💼',
+                            'cfo': '👔'
+                        }.get(comm['role'], '💬')
+                        
+                        st.markdown(f"{role_emoji} **{comm['role'].upper()}** ({comm['user_name']}) - {comm['commented_at']}")
+                        st.info(comm['comment'])
+                else:
+                    st.write("No comments yet")
+                
+                # Allow maker to add response/revision comment
+                st.write("---")
+                revision_comment = st.text_area(
+                    "Add your revision comment:",
+                    key=f"revision_{item['id']}",
+                    placeholder="Explain what you've revised or provide additional justification..."
+                )
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    if st.button("✅ Re-submit to Reviewer", key=f"resubmit_{item['id']}", type="primary"):
+                        if not revision_comment.strip():
+                            st.error("Please add a revision comment before re-submitting")
+                        else:
+                            try:
+                                # Add revision comment
+                                add_comment(item['id'], revision_comment, current_user_id(), 'maker')
+                                
+                                # Get first available reviewer
+                                with get_db() as db:
+                                    reviewer = db.execute("SELECT id FROM users WHERE role='reviewer' LIMIT 1").fetchone()
+                                    reviewer_id = reviewer['id'] if reviewer else None
+                                
+                                if not reviewer_id:
+                                    st.error("No reviewer found in system")
+                                else:
+                                    # Approve to reviewer
+                                    approve_to_next_stage(item['id'], current_user_id(), 'maker', reviewer_id)
+                                    st.success("✅ Re-submitted to reviewer!")
+                                    st.rerun()
+                            except Exception as e:
+                                st.error(f"Error re-submitting: {str(e)}")
+                
+                with col2:
+                    if st.button("❌ Disapprove GL", key=f"disapprove_pending_{item['id']}"):
+                        st.session_state[f'disapprove_pending_{item["id"]}'] = True
+                
+                # Handle disapproval of pending item
+                if st.session_state.get(f'disapprove_pending_{item["id"]}', False):
+                    st.error("⚠️ Disapproving this GL will remove it from the workflow")
+                    disapprove_pending_reason = st.text_area(
+                        "Reason for permanent disapproval:",
+                        key=f"disapprove_pending_reason_{item['id']}",
+                        placeholder="This GL is incorrect and should be removed because..."
+                    )
+                    
+                    col_cancel, col_confirm = st.columns(2)
+                    with col_cancel:
+                        if st.button("Cancel", key=f"cancel_disapprove_{item['id']}"):
+                            st.session_state[f'disapprove_pending_{item["id"]}'] = False
+                            st.rerun()
+                    
+                    with col_confirm:
+                        if st.button("⚠️ Confirm Disapproval", key=f"confirm_disapprove_pending_{item['id']}", type="primary"):
+                            if not disapprove_pending_reason.strip():
+                                st.error("Please provide a reason")
+                            else:
+                                try:
+                                    # Add disapproval comment
+                                    add_comment(item['id'], f"[MAKER DISAPPROVED] {disapprove_pending_reason}", 
+                                              current_user_id(), 'maker')
+                                    
+                                    # Update status to disapproved
+                                    with get_db() as db:
+                                        db.execute("UPDATE trial_lines SET status='disapproved' WHERE id=?", (item['id'],))
+                                    
+                                    st.success("✅ GL disapproved and removed from workflow")
+                                    st.session_state[f'disapprove_pending_{item["id"]}'] = False
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error: {str(e)}")
