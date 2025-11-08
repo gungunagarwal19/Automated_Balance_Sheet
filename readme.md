@@ -60,3 +60,7 @@ The system architecture follows a modular, scalable design with five main layers
    Present results on an interactive dashboard with reviewer feedback support.
 
 ---
+
+## 🧩 Architecture Diagram  
+<img width="1810" height="971" alt="Screenshot 2025-11-07 102528" src="https://github.com/user-attachments/assets/e4cf1578-f781-4ac3-b501-8ff88c45daba" />
+

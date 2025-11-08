@@ -1,0 +1,60 @@
+# sql_chatbot.py
+import psycopg2
+
+DB_PARAMS = {
+    "dbname": "neondb",
+    "user": "neondb_owner",
+    "password": "npg_TvZiyahl4H3m",
+    "host": "ep-twilight-river-ahdd9h45-pooler.c-3.us-east-1.aws.neon.tech",
+    "port": 5432,
+    "sslmode": "require"
+}
+
+def run_query(gl_account=None, cycle=None, min_variance=None, max_records=5):
+    conn = psycopg2.connect(**DB_PARAMS)
+    cur = conn.cursor()
+    # Build WHERE clause dynamically
+    clauses = []
+    params = []
+    if gl_account: 
+        clauses.append("gl_account = %s")
+        params.append(gl_account)
+    if cycle:
+        clauses.append("review_cycle = %s")
+        params.append(cycle)
+    if min_variance:
+        clauses.append("ABS(variance_value) >= %s")
+        params.append(min_variance)
+    clause = " AND ".join(clauses) if clauses else "TRUE"
+    sql = f"""
+        SELECT gl_account, review_cycle, prev_amount, current_amount, variance_value, record_text
+        FROM gl_reviews
+        WHERE {clause}
+        ORDER BY review_cycle DESC
+        LIMIT {max_records};
+    """
+    cur.execute(sql, params)
+    results = cur.fetchall()
+    cur.close()
+    conn.close()
+    return results
+
+# Example interactive chatbot loop
+def main():
+    print("SQL GL Reviews Chatbot\n")
+    while True:
+        acct = input("Enter GL account (or leave blank): ").strip() or None
+        cycle = input("Enter cycle number (or leave blank): ").strip() or None
+        min_var = input("Enter min variance % (or leave blank): ").strip() or None
+        # Convert cycle/min_var if present
+        cycle = int(cycle) if cycle else None
+        min_var = float(min_var) if min_var else None
+        res = run_query(gl_account=acct, cycle=cycle, min_variance=min_var)
+        if not res:
+            print("No results found.")
+        for r in res:
+            print(f"\n{r[-1]}")  # record_text
+        print("\n---")
+
+if __name__ == "__main__":
+    main()
